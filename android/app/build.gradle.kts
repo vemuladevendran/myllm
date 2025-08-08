@@ -29,26 +29,26 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 
-       // ✅ NDK ABI filter (Kotlin DSL)
+    //    // ✅ NDK ABI filter (Kotlin DSL)
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
 
-        // ✅ Hook CMake for our native bridge
-        externalNativeBuild {
-            cmake {
-                // You can pass flags here if you want
-                // cppFlags += listOf("-std=c++17")
-            }
-        }
+    //     // ✅ Hook CMake for our native bridge
+    //     externalNativeBuild {
+    //         cmake {
+    //             // You can pass flags here if you want
+    //             // cppFlags += listOf("-std=c++17")
+    //         }
+    //     }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
-    }
+    // externalNativeBuild {
+    //     cmake {
+    //         path = file("src/main/cpp/CMakeLists.txt")
+    //         version = "3.22.1"
+    //     }
+    // }
 
     packaging {
         jniLibs {
