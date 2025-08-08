@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/model_metadata.dart';
 
 class InputBar extends StatefulWidget {
-  final Function(String, String) onSend;
+  final Function(String, ModelMetadata) onSend;
   final List<ModelMetadata> downloadedModels;
 
   const InputBar({
@@ -18,7 +18,7 @@ class InputBar extends StatefulWidget {
 
 class _InputBarState extends State<InputBar> {
   final TextEditingController _controller = TextEditingController();
-  String? _selectedModel;
+  ModelMetadata? _selectedModel;
 
   void _submit() {
     final text = _controller.text.trim();
@@ -32,7 +32,7 @@ class _InputBarState extends State<InputBar> {
   void initState() {
     super.initState();
     if (widget.downloadedModels.isNotEmpty) {
-      _selectedModel = widget.downloadedModels.first.name;
+      _selectedModel = widget.downloadedModels.first;
     }
   }
 
@@ -41,7 +41,7 @@ class _InputBarState extends State<InputBar> {
     super.didUpdateWidget(oldWidget);
     if (_selectedModel == null && widget.downloadedModels.isNotEmpty) {
       setState(() {
-        _selectedModel = widget.downloadedModels.first.name;
+        _selectedModel = widget.downloadedModels.first;
       });
     }
   }
@@ -66,11 +66,11 @@ class _InputBarState extends State<InputBar> {
         ),
         child: Row(
           children: [
-            DropdownButton<String>(
+            DropdownButton<ModelMetadata>(
               value: _selectedModel,
               items: widget.downloadedModels.map((model) {
                 return DropdownMenuItem(
-                  value: model.name,
+                  value: model,
                   child: Text(model.name),
                 );
               }).toList(),
@@ -86,7 +86,7 @@ class _InputBarState extends State<InputBar> {
               child: TextField(
                 controller: _controller,
                 decoration: const InputDecoration(
-                  hintText: "Enter a prompt...",
+                  hintText: "Enter your prompt...",
                   border: InputBorder.none,
                   isDense: true,
                 ),

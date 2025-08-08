@@ -45,9 +45,17 @@ class ModelProvider with ChangeNotifier {
       downloadUrl: 'https://huggingface.co/flyingfishinwater/good_and_small_models/resolve/main/Qwen3-4B-IQ4_NL.gguf?download=true',
       hfUrl: 'https://huggingface.co/Qwen/Qwen3-4B',
     ),
+    ModelMetadata(
+      id: 'ggml-org/SmolVLM-500M-Instruct-GGUF',
+      name: 'SmolVLM',
+      description: 'SmolVLM 500M Instruct Model',
+      sizeMB: 250.0,
+      downloadUrl: 'https://huggingface.co/ggml-org/SmolVLM-500M-Instruct-GGUF/resolve/main/SmolVLM-500M-Instruct-Q8_0.gguf?download=true',
+      hfUrl: 'https://huggingface.co/ggml-org/SmolVLM-500M-Instruct-GGUF',
+    ),
   ];
 
-  List<ModelMetadata> get models => _models;
+   List<ModelMetadata> get models => _models;
 
   void markDownloaded(String id) {
     final model = _models.firstWhere((m) => m.id == id);
@@ -57,12 +65,17 @@ class ModelProvider with ChangeNotifier {
 
   Future<void> checkIfModelDownloaded() async {
     final dir = await getApplicationDocumentsDirectory();
-
     for (var model in _models) {
       final file = File('${dir.path}/${model.name.replaceAll(' ', '_')}.gguf');
       model.isDownloaded = await file.exists();
     }
-
     notifyListeners();
   }
+
+  void markUndownloaded(String id) {
+  final model = _models.firstWhere((m) => m.id == id);
+  model.isDownloaded = false;
+  notifyListeners();
+}
+
 }

@@ -66,9 +66,11 @@ class _ModelTileState extends State<ModelTile> {
     if (confirm ?? false) {
       final fileName = widget.model.name.replaceAll(' ', '_');
       await DownloadManager().deleteModel(fileName);
-      setState(() {
-        widget.model.isDownloaded = false;
-      });
+
+      if (mounted) {
+        final provider = context.read<ModelProvider>();
+        provider.markUndownloaded(widget.model.id);
+      }
     }
   }
 

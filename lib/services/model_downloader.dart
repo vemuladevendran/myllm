@@ -30,10 +30,15 @@ class DownloadTask {
       final filePath = '${dir.path}/$fileName.gguf';
       final file = File(filePath);
 
+      print("📥 Starting download for: $modelId");
+      print("⬇️ Download URL: $downloadUrl");
+      print("📁 Saving to: $filePath");
+
       final request = http.Request('GET', Uri.parse(downloadUrl));
       final response = await http.Client().send(request);
 
       if (response.statusCode != 200 && response.statusCode != 206) {
+        print("❌ Failed to download. Status: ${response.statusCode}");
         isError = true;
         onError();
         return;
@@ -44,31 +49,35 @@ class DownloadTask {
 
       _subscription = response.stream.listen(
         (List<int> chunk) {
-          // ✅ FIXED: explicitly typed
-          received += chunk.length; // ✅ No type error now
+          received += chunk.length;
           sink.add(chunk);
+          // 🔄 Real-time update
+          onComplete();
         },
-
         onDone: () async {
           await sink.flush();
           await sink.close();
           isDone = true;
+          print("✅ Download complete: $filePath");
           onComplete();
         },
         onError: (e) async {
+          print("❌ Error during download: $e");
           isError = true;
           await sink.close();
           onError();
         },
         cancelOnError: true,
       );
-    } catch (_) {
+    } catch (e) {
+      print("❌ Download exception: $e");
       isError = true;
       onError();
     }
   }
 
   Future<void> cancel() async {
+    print("🛑 Canceling download: $modelId");
     await _subscription?.cancel();
   }
 }
@@ -88,6 +97,8 @@ class DownloadManager extends ChangeNotifier {
   }) {
     if (_tasks.containsKey(modelId)) return;
 
+    print("🚀 Initiating download for model: $modelId");
+
     final task = DownloadTask(
       modelId: modelId,
       fileName: fileName,
@@ -98,14 +109,14 @@ class DownloadManager extends ChangeNotifier {
 
     task.start(
       () {
-        notifyListeners();
+        notifyListeners(); // Real-time update
       },
       () {
-        notifyListeners();
+        notifyListeners(); // Error update
       },
     );
 
-    notifyListeners();
+    notifyListeners(); // Initial UI update
   }
 
   Future<void> deleteModel(String fileName) async {
@@ -113,14 +124,20 @@ class DownloadManager extends ChangeNotifier {
     final filePath = '${dir.path}/$fileName.gguf';
     final file = File(filePath);
 
+    print("🗑 Attempting to delete: $filePath");
+
     if (await file.exists()) {
       await file.delete();
+      print("✅ File deleted: $filePath");
+    } else {
+      print("⚠️ File not found for deletion: $filePath");
     }
 
     notifyListeners();
   }
 
   void cancel(String modelId) async {
+    print("🛑 Cancel request for: $modelId");
     await _tasks[modelId]?.cancel();
     _tasks.remove(modelId);
     notifyListeners();
