@@ -65,7 +65,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Run inference
     debugPrint("[CHAT] Running model: $_loadedModel with prompt='${prompt.replaceAll('\n', ' ')}'");
-    final reply = await runModel(prompt, maxTokens: 64);
+    final reply = await runModel(prompt, maxTokens: 250);
 
     setState(() {
       _messages.insert(
