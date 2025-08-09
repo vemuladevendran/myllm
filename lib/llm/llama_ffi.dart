@@ -2,85 +2,77 @@
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
+// load our bridge .so
 DynamicLibrary _openBridge() {
-  // Android/iOS: name only
-  const libName = "libllama_bridge.so";
-  try {
-    final lib = DynamicLibrary.open(libName);
-    if (kDebugMode) {
-      print("[FFI] Opened $libName");
-    }
-    return lib;
-  } catch (e) {
-    // As fallback (rare), try loading from absolute path in app lib dir
-    // But usually not needed; comment this next block if unnecessary.
-    if (kDebugMode) {
-      print("[FFI] Failed to open $libName via default loader: $e");
-    }
-    rethrow;
-  }
+  final lib = DynamicLibrary.open('libllama_bridge.so');
+  if (kDebugMode) print('[FFI] Opened libllama_bridge.so');
+  return lib;
 }
 
-// C signatures
-typedef _LbLoadNative = Int32 Function(Pointer<Utf8>);
+typedef _LbLoadNative     = Int32 Function(Pointer<Utf8>);
 typedef _LbIsLoadedNative = Int32 Function();
-typedef _LbFreeNative = Void Function();
+typedef _LbFreeNative     = Void Function();
+typedef _LbEvalNative     = Pointer<Utf8> Function(Pointer<Utf8>, Int32);
 
-// Dart signatures
-typedef _LbLoadDart = int Function(Pointer<Utf8>);
+typedef _LbLoadDart     = int Function(Pointer<Utf8>);
 typedef _LbIsLoadedDart = int Function();
-typedef _LbFreeDart = void Function();
+typedef _LbFreeDart     = void Function();
+typedef _LbEvalDart     = Pointer<Utf8> Function(Pointer<Utf8>, int);
 
-final DynamicLibrary _bridge = _openBridge();
+final _bridge = _openBridge();
 
-final _LbLoadDart _lbLoad =
+late final _LbLoadDart _lbLoad =
     _bridge.lookup<NativeFunction<_LbLoadNative>>('lb_load').asFunction();
-
-final _LbIsLoadedDart _lbIsLoaded =
+late final _LbIsLoadedDart _lbIsLoaded =
     _bridge.lookup<NativeFunction<_LbIsLoadedNative>>('lb_is_loaded').asFunction();
-
-final _LbFreeDart _lbFree =
+late final _LbFreeDart _lbFree =
     _bridge.lookup<NativeFunction<_LbFreeNative>>('lb_free').asFunction();
+late final _LbEvalDart _lbEval =
+    _bridge.lookup<NativeFunction<_LbEvalNative>>('lb_eval').asFunction();
 
+/// Loads `/data/user/0/<pkg>/files/<modelName>.gguf`
 Future<bool> loadModel(String modelName) async {
   final dir = await getApplicationDocumentsDirectory();
-  // Your files are like SmolVLM.gguf (no double extension)
-  final modelPath = '${dir.path}/${modelName.replaceAll(' ', '_')}';
-  if (kDebugMode) {
-    print("[FFI] Loading model: $modelPath");
-  }
+  final path = '${dir.path}/${modelName.replaceAll(' ', '_')}';
+  if (kDebugMode) print('[FFI] Loading model: $path');
 
-  final f = File(modelPath);
+  final f = File(path);
   if (!f.existsSync()) {
-    if (kDebugMode) {
-      print("❌ Model not found at: $modelPath");
-    }
+    if (kDebugMode) print('❌ Model not found: $path');
     return false;
   }
 
-  final cPath = modelPath.toNativeUtf8();
+  final cPath = path.toNativeUtf8();
   try {
     final rc = _lbLoad(cPath);
-    if (kDebugMode) {
-      print("[FFI] lb_load rc=$rc");
-    }
+    if (kDebugMode) print('[FFI] lb_load rc=$rc, isLoaded=${_lbIsLoaded()}');
     return rc == 0 && _lbIsLoaded() == 1;
+  } catch (e) {
+    if (kDebugMode) print('❌ lb_load threw: $e');
+    return false;
   } finally {
     malloc.free(cPath);
   }
 }
 
 Future<String> runModel(String prompt) async {
-  // For now, your C++ bridge doesn’t implement lb_eval returning text.
-  // Just return a placeholder until you add lb_eval.
-  return "Model loaded ✅ — implement lb_eval in C++ to get real text.";
+  if (_lbIsLoaded() != 1) return 'Model NOT loaded';
+  final cPrompt = prompt.toNativeUtf8();
+  try {
+    final ptr = _lbEval(cPrompt, 64);
+    final text = ptr.cast<Utf8>().toDartString(); // from static buffer (don't free)
+    return text;
+  } catch (e) {
+    return 'lb_eval error: $e';
+  } finally {
+    malloc.free(cPrompt);
+  }
 }
 
 void freeModel() {
-  try {
-    _lbFree();
-  } catch (_) {}
+  try { _lbFree(); } catch (_) {}
+  if (kDebugMode) print('[FFI] freed');
 }
