@@ -25,7 +25,9 @@ class _InputBarState extends State<InputBar> {
 
     if (_selectedModel == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please select a downloaded model first.")),
+        const SnackBar(
+          content: Text("Please select a downloaded model first."),
+        ),
       );
       return;
     }
@@ -67,15 +69,16 @@ class _InputBarState extends State<InputBar> {
         margin: const EdgeInsets.all(8),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
-          border: Border.all(color: Colors.grey.shade400),
+          border: Border.all(color: Theme.of(context).dividerColor),
           borderRadius: BorderRadius.circular(12),
-          color: Colors.white,
+          color: Theme.of(context).cardColor,
           boxShadow: [
-            BoxShadow(
-              color: Colors.grey.shade200,
-              blurRadius: 4,
-              offset: const Offset(0, 2),
-            ),
+            if (Theme.of(context).brightness == Brightness.light)
+              BoxShadow(
+                color: Colors.grey.shade200,
+                blurRadius: 4,
+                offset: const Offset(0, 2),
+              ),
           ],
         ),
         child: Row(
@@ -84,10 +87,7 @@ class _InputBarState extends State<InputBar> {
               value: _selectedModel,
               hint: const Text("Select model"),
               items: widget.downloadedModels.map((model) {
-                return DropdownMenuItem(
-                  value: model,
-                  child: Text(model.name),
-                );
+                return DropdownMenuItem(value: model, child: Text(model.name));
               }).toList(),
               onChanged: hasModels
                   ? (value) {

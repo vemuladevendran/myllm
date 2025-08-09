@@ -16,21 +16,19 @@ class ChatApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MultiProvider(
       providers: [
-        ChangeNotifierProvider(create: (_) => ModelProvider()..checkIfModelDownloaded()),
+        ChangeNotifierProvider(
+          create: (_) => ModelProvider()..checkIfModelDownloaded(),
+        ),
         ChangeNotifierProvider(create: (_) => DownloadManager()),
       ],
       child: MaterialApp(
         title: 'Chat with Gemini',
         debugShowCheckedModeBanner: false,
-        theme: lightTheme,
-        darkTheme: darkTheme,
+        theme: ThemeData.light(),
+        darkTheme: ThemeData.dark(),
         themeMode: ThemeMode.system,
         home: const Shell(),
       ),
     );
   }
-
-  
 }
-
-
