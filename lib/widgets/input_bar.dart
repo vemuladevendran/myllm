@@ -1,4 +1,3 @@
-// lib/widgets/input_bar.dart
 import 'package:flutter/material.dart';
 import '../models/model_metadata.dart';
 
@@ -22,10 +21,17 @@ class _InputBarState extends State<InputBar> {
 
   void _submit() {
     final text = _controller.text.trim();
-    if (text.isNotEmpty && _selectedModel != null) {
-      widget.onSend(text, _selectedModel!);
-      _controller.clear();
+    if (text.isEmpty) return;
+
+    if (_selectedModel == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Please select a downloaded model first.")),
+      );
+      return;
     }
+
+    widget.onSend(text, _selectedModel!);
+    _controller.clear();
   }
 
   @override
@@ -39,15 +45,23 @@ class _InputBarState extends State<InputBar> {
   @override
   void didUpdateWidget(covariant InputBar oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // If the list changed and current selection is no longer valid, reselect
     if (_selectedModel == null && widget.downloadedModels.isNotEmpty) {
+      setState(() => _selectedModel = widget.downloadedModels.first);
+    } else if (_selectedModel != null &&
+        !widget.downloadedModels.contains(_selectedModel)) {
       setState(() {
-        _selectedModel = widget.downloadedModels.first;
+        _selectedModel = widget.downloadedModels.isNotEmpty
+            ? widget.downloadedModels.first
+            : null;
       });
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final hasModels = widget.downloadedModels.isNotEmpty;
+
     return SafeArea(
       child: Container(
         margin: const EdgeInsets.all(8),
@@ -68,34 +82,38 @@ class _InputBarState extends State<InputBar> {
           children: [
             DropdownButton<ModelMetadata>(
               value: _selectedModel,
+              hint: const Text("Select model"),
               items: widget.downloadedModels.map((model) {
                 return DropdownMenuItem(
                   value: model,
                   child: Text(model.name),
                 );
               }).toList(),
-              onChanged: (value) {
-                setState(() {
-                  _selectedModel = value;
-                });
-              },
+              onChanged: hasModels
+                  ? (value) {
+                      setState(() => _selectedModel = value);
+                    }
+                  : null,
               underline: const SizedBox.shrink(),
             ),
             const SizedBox(width: 12),
             Expanded(
               child: TextField(
                 controller: _controller,
-                decoration: const InputDecoration(
-                  hintText: "Enter your prompt...",
+                decoration: InputDecoration(
+                  hintText: hasModels
+                      ? "Enter your prompt..."
+                      : "Download a model first (Models tab)",
                   border: InputBorder.none,
                   isDense: true,
                 ),
+                enabled: hasModels,
                 onSubmitted: (_) => _submit(),
               ),
             ),
             IconButton(
               icon: const Icon(Icons.send),
-              onPressed: _submit,
+              onPressed: hasModels ? _submit : null,
             ),
           ],
         ),

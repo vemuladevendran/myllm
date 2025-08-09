@@ -1,4 +1,3 @@
-// lib/screens/chat_screen.dart
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../widgets/message_bubble.dart';
@@ -17,46 +16,62 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final List<ChatMessage> _messages = [];
-  String? _loadedModel;
+  String? _loadedModel; // this stores the model *name* (without .gguf)
+  bool _isLoadingModel = false;
 
   Future<void> _handleSend(String prompt, ModelMetadata selectedModel) async {
+    // Insert the user message immediately
     setState(() {
       _messages.insert(
         0,
         ChatMessage(
-          id: DateTime.now().toString(),
+          id: DateTime.now().toIso8601String(),
           text: "🧑 $prompt",
           type: MessageType.user,
         ),
       );
     });
 
-    final modelFilename = "${selectedModel.name.replaceAll(' ', '_')}.gguf";
+    final modelName = selectedModel.name; // <- pass plain name, no ".gguf"
+    debugPrint("[CHAT] selectedModel = ${selectedModel.name} (downloaded=${selectedModel.isDownloaded})");
+    debugPrint("[CHAT] _loadedModel = $_loadedModel");
 
-    if (_loadedModel != modelFilename) {
-      final success = await loadModel(modelFilename);
-      if (!success) {
+    // Load model if it's not the current one
+    if (_loadedModel != modelName) {
+      setState(() => _isLoadingModel = true);
+      debugPrint("[CHAT] Loading model: $modelName");
+
+      final ok = await loadModel(modelName);
+      setState(() => _isLoadingModel = false);
+
+      if (!ok) {
+        debugPrint("[CHAT] ❌ Failed to load model: $modelName");
         setState(() {
           _messages.insert(
             0,
             ChatMessage(
-              id: DateTime.now().toString(),
-              text: "❌ Failed to load model: $modelFilename",
+              id: DateTime.now().toIso8601String(),
+              text: "❌ Failed to load model: $modelName",
               type: MessageType.bot,
             ),
           );
         });
         return;
       }
-      _loadedModel = modelFilename;
+
+      debugPrint("[CHAT] ✅ Model loaded: $modelName");
+      _loadedModel = modelName;
     }
 
-    final reply = await runModel(prompt);
+    // Run inference
+    debugPrint("[CHAT] Running model: $_loadedModel with prompt='${prompt.replaceAll('\n', ' ')}'");
+    final reply = await runModel(prompt, maxTokens: 64);
+
     setState(() {
       _messages.insert(
         0,
         ChatMessage(
-          id: DateTime.now().toString(),
+          id: DateTime.now().toIso8601String(),
           text: "🤖 $reply",
           type: MessageType.bot,
         ),
@@ -79,6 +94,17 @@ class _ChatScreenState extends State<ChatScreen> {
             padding: EdgeInsets.all(16),
             child: Text("Chat with Local LLM", style: TextStyle(fontSize: 20)),
           ),
+          if (_isLoadingModel)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              margin: const EdgeInsets.only(bottom: 6),
+              decoration: BoxDecoration(
+                color: Colors.amber.shade100,
+                border: Border.all(color: Colors.amber.shade300),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Text("⏳ Loading model..."),
+            ),
           Expanded(
             child: ListView.builder(
               reverse: true,
