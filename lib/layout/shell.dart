@@ -43,7 +43,7 @@ class _ShellState extends State<Shell> {
         onItemSelected: _onItemSelected,
       ),
       appBar: AppBar(
-        title: const Text('Chat with Gemini'),
+        title: const Text('Chat with your LLM'),
       ),
       body: _getScreen(),
     );

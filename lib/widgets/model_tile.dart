@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
 import '../models/model_metadata.dart';
 import '../services/model_downloader.dart';
 import '../state/model_provider.dart';
@@ -16,32 +17,42 @@ class ModelTile extends StatefulWidget {
 
 class _ModelTileState extends State<ModelTile> {
   late Stopwatch _stopwatch;
+  Timer? _ticker;
 
   @override
   void initState() {
     super.initState();
     _stopwatch = Stopwatch()..start();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
   }
 
   String _formatBytes(int bytes) {
-    const kb = 1024;
-    const mb = kb * 1024;
-    if (bytes > mb) return '${(bytes / mb).toStringAsFixed(2)} MB';
-    if (bytes > kb) return '${(bytes / kb).toStringAsFixed(2)} KB';
+    const kb = 1024, mb = kb * 1024, gb = mb * 1024;
+    if (bytes >= gb) return '${(bytes / gb).toStringAsFixed(2)} GB';
+    if (bytes >= mb) return '${(bytes / mb).toStringAsFixed(2)} MB';
+    if (bytes >= kb) return '${(bytes / kb).toStringAsFixed(2)} KB';
     return '$bytes B';
   }
 
-  String _estimatedTimeLeft(int received, int total) {
-    if (received == 0 || _stopwatch.elapsed.inSeconds == 0) return '--';
-    double speed = received / _stopwatch.elapsed.inSeconds;
-    double remaining = (total - received) / speed;
+  String _eta(int received, int total) {
+    if (received <= 0 || _stopwatch.elapsed.inSeconds == 0) return '--';
+    final speed = received / _stopwatch.elapsed.inSeconds;
+    final remaining = (total - received) / (speed > 1 ? speed : 1);
     return '${remaining.toStringAsFixed(1)}s left';
   }
 
   void _startDownload() {
     context.read<DownloadManager>().downloadModel(
           modelId: widget.model.id,
-          fileName: widget.model.name.replaceAll(' ', '_'),
+          fileName: widget.model.name,       // DISPLAY name (may contain '/')
           downloadUrl: widget.model.downloadUrl,
         );
   }
@@ -50,7 +61,7 @@ class _ModelTileState extends State<ModelTile> {
     context.read<DownloadManager>().cancel(widget.model.id);
   }
 
-  void _deleteModel() async {
+  Future<void> _deleteModel() async {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
@@ -64,55 +75,50 @@ class _ModelTileState extends State<ModelTile> {
     );
 
     if (confirm ?? false) {
-      final fileName = widget.model.name.replaceAll(' ', '_');
-      await DownloadManager().deleteModel(fileName);
-
-      if (mounted) {
-        final provider = context.read<ModelProvider>();
-        provider.markUndownloaded(widget.model.id);
-      }
+      await context.read<DownloadManager>().deleteModel(
+            widget.model.name,   // DISPLAY name; downloader sanitizes
+            modelId: widget.model.id,
+          );
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final model = widget.model;
-    final task = context.watch<DownloadManager>().getTask(model.id);
 
+    final task = context.watch<DownloadManager>().getTask(model.id);
     final isDownloading = task != null && !task.isDone;
     final progress = task?.progress ?? 0.0;
-    final downloaded = task?.received ?? 0;
-    final total = task?.total ?? 1;
+    final received = task?.received ?? 0;
+    final total = task?.total ?? 0;
+
+    final isDownloaded = context.select<ModelProvider, bool>(
+      (p) => p.isModelDownloaded(model.id),
+    );
 
     return Card(
-      elevation: 3,
+      elevation: 2,
       margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
       child: ListTile(
-        title: Text(model.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+        title: Text(model.name, style: const TextStyle(fontWeight: FontWeight.bold)), // DISPLAY name
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(model.description),
-            const SizedBox(height: 4),
+            const SizedBox(height: 6),
             Text('${model.sizeMB.toStringAsFixed(0)} MB'),
-            if (isDownloading)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    LinearProgressIndicator(value: progress),
-                    const SizedBox(height: 6),
-                    Text(
-                      '${_formatBytes(downloaded)} / ${_formatBytes(total)} — ${_estimatedTimeLeft(downloaded, total)}',
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                  ],
-                ),
+            if (isDownloading) ...[
+              const SizedBox(height: 10),
+              LinearProgressIndicator(value: progress == 0 ? null : progress),
+              const SizedBox(height: 6),
+              Text(
+                '${_formatBytes(received)} / ${_formatBytes(total)} • ${_eta(received, total)}',
+                style: const TextStyle(fontSize: 12),
               ),
+            ],
           ],
         ),
-        trailing: model.isDownloaded
+        trailing: isDownloaded
             ? IconButton(icon: const Icon(Icons.delete), onPressed: _deleteModel)
             : isDownloading
                 ? IconButton(icon: const Icon(Icons.close), onPressed: _cancelDownload)

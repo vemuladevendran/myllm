@@ -8,11 +8,19 @@ class ModelManagerScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final models = Provider.of<ModelProvider>(context).models;
+    final models = context.watch<ModelProvider>().models;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Model Manager'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () {
+              context.read<ModelProvider>().checkIfModelDownloaded();
+            },
+          )
+        ],
       ),
       body: ListView.builder(
         itemCount: models.length,

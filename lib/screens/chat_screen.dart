@@ -1,14 +1,15 @@
+// lib/screens/chat_screen.dart
+import 'dart:io';
 import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 
 import '../llm/llama_worker.dart';
-import '../llm/llama_ffi.dart'; // for clearHistory()
 import '../models/chat_message.dart';
 import '../models/model_metadata.dart';
 import '../services/chat_storage.dart';
+import '../services/file_naming.dart'; // toGgufFileName
 import '../state/model_provider.dart';
 import '../widgets/input_bar.dart';
 import '../widgets/message_bubble.dart';
@@ -22,12 +23,13 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final List<ChatMessage> _messages = [];
-  String? _loadedModel; // model name (without .gguf)
+  String? _loadedModel; // DISPLAY name
   bool _isLoadingModel = false;
-  bool _isThinking = false; // spinner for pending bot reply
+  bool _isThinking = false;
   late final LlamaWorker _worker;
 
-  // sessions
+  int _adaptiveMax = 128; // adaptive cap for streaming
+
   String _sessionId = _newSessionId();
   static String _newSessionId() =>
       's_${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(9999)}';
@@ -36,7 +38,18 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _worker = LlamaWorker();
-    _worker.start(); // background isolate
+    _safeStart();
+  }
+
+  Future<void> _safeStart() async {
+    try {
+      await _worker.start();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Worker failed to start: $e')),
+      );
+    }
   }
 
   @override
@@ -51,8 +64,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _sessionId = _newSessionId();
       _isThinking = false;
     });
-    // Clear native KV but keep the model loaded
-    clearHistory();
+    try { await _worker.clearHistory(); } catch (_) {}
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Started a new chat')),
@@ -60,73 +72,109 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _handleSend(String prompt, ModelMetadata selectedModel) async {
-    // 1) add user message + persist
-    final userMsg = ChatMessage(
-      id: DateTime.now().toIso8601String(),
-      text: "🧑 $prompt",
-      type: MessageType.user,
-    );
-    setState(() {
-      _messages.insert(0, userMsg);
-    });
-    await ChatStorage.saveMessage(_sessionId, userMsg);
+ Future<void> _handleSend(String prompt, ModelMetadata selectedModel) async {
+  // Don’t allow overlapping requests while we stream
+  if (_isThinking) return;
 
-    final modelName = selectedModel.name;
-    debugPrint(
-        "[CHAT] selectedModel = ${selectedModel.name} (downloaded=${selectedModel.isDownloaded})");
-    debugPrint("[CHAT] _loadedModel = $_loadedModel");
+  // 1) Insert the user message immediately + persist
+  final userMsg = ChatMessage(
+    id: DateTime.now().toIso8601String(),
+    text: "🧑 $prompt",
+    type: MessageType.user,
+  );
+  setState(() => _messages.insert(0, userMsg));
+  await ChatStorage.saveMessage(_sessionId, userMsg);
 
-    // 2) load model in background isolate if needed — pass FULL PATH from UI isolate
-    if (_loadedModel != modelName) {
-      setState(() => _isLoadingModel = true);
+  final modelName = selectedModel.name; // display name (may contain '/')
 
+  // 2) Load model if needed (build absolute path using the *sanitized file name*)
+  if (_loadedModel != modelName) {
+    setState(() => _isLoadingModel = true);
+    bool ok = false;
+    String? err;
+
+    try {
       final dir = await getApplicationDocumentsDirectory();
-      final hasExt = modelName.toLowerCase().endsWith('.gguf');
-      final fullPath =
-          '${dir.path}/${hasExt ? modelName : '$modelName.gguf'}';
+      final safeFile = toGgufFileName(modelName);         // e.g. "Microsoft/Phi-3" -> "Microsoft_Phi-3.gguf"
+      final fullPath = '${dir.path}/$safeFile';           // DO NOT replace slashes in the full path
 
-      final ok = await _worker.loadModelAtPath(fullPath);
+      debugPrint('[CHAT] Trying to load: $fullPath');
+      debugPrint('[CHAT] File exists? ${await File(fullPath).exists()}');
+
+      ok = await _worker.loadModelAtPath(
+        fullPath,
+        timeout: const Duration(seconds: 90),
+      );
+    } catch (e) {
+      err = e.toString();
+    } finally {
+      if (!mounted) return;
       setState(() => _isLoadingModel = false);
-
-      if (!ok) {
-        final err = ChatMessage(
-          id: DateTime.now().toIso8601String(),
-          text: "❌ Failed to load model: $modelName",
-          type: MessageType.bot,
-        );
-        setState(() => _messages.insert(0, err));
-        await ChatStorage.saveMessage(_sessionId, err);
-        return;
-      }
-      _loadedModel = modelName;
     }
 
-    // 3) show placeholder “typing …”
-    final placeholderId = 'pending_${DateTime.now().microsecondsSinceEpoch}';
-    final pending = ChatMessage(
-      id: placeholderId,
-      text: "🤖 …",
-      type: MessageType.bot,
+    if (!ok) {
+      setState(() {
+        _messages.insert(
+          0,
+          ChatMessage(
+            id: DateTime.now().toIso8601String(),
+            text: "❌ Failed to load model: ${err ?? modelName}",
+            type: MessageType.bot,
+          ),
+        );
+      });
+      return;
+    }
+
+    _loadedModel = modelName;
+  }
+
+  // 3) Create a live placeholder and stream tokens into it
+  final placeholderId = 'pending_${DateTime.now().microsecondsSinceEpoch}';
+  var liveText = '🤖 ';
+  setState(() {
+    _isThinking = true;
+    _messages.insert(
+      0,
+      ChatMessage(id: placeholderId, text: liveText, type: MessageType.bot),
     );
-    setState(() {
-      _isThinking = true;
-      _messages.insert(0, pending);
-    });
+  });
 
-    // 4) run inference in background isolate
-    final replyText = await _worker.eval(prompt, maxTokens: 128);
+  final start = DateTime.now();
+  int tokenPieces = 0;
 
-    // 5) replace placeholder with final message + persist
-    final idx = _messages.indexWhere((m) => m.id == placeholderId);
+  try {
+    // 4) Stream eval with watchdog (won’t hang the UI)
+    await _worker.streamEval(
+      prompt,
+      maxTokens: _adaptiveMax,                       // adaptive cap you track in state
+      maxTotalTime: const Duration(seconds: 180),    // hard cap
+      maxSilence: const Duration(seconds: 15),       // cancel if no activity for 15s
+      onToken: (piece) {
+        tokenPieces++;
+        liveText += piece;
+
+        // Update the placeholder bubble quickly
+        final idx = _messages.indexWhere((m) => m.id == placeholderId);
+        if (idx >= 0) {
+          setState(() {
+            _messages[idx] =
+                ChatMessage(id: placeholderId, text: liveText, type: MessageType.bot);
+          });
+        }
+      },
+    );
+
+    // 5) Finalize + persist
     final botMsg = ChatMessage(
       id: DateTime.now().toIso8601String(),
-      text: "🤖 $replyText",
+      text: liveText, // already includes 🤖 prefix
       type: MessageType.bot,
     );
 
     setState(() {
       _isThinking = false;
+      final idx = _messages.indexWhere((m) => m.id == placeholderId);
       if (idx >= 0) {
         _messages.removeAt(idx);
         _messages.insert(0, botMsg);
@@ -135,7 +183,29 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     });
     await ChatStorage.saveMessage(_sessionId, botMsg);
+
+    // 6) Adapt future maxTokens toward recent length (+headroom)
+    final target = (0.7 * _adaptiveMax + 0.3 * (tokenPieces + 32)).toInt();
+    _adaptiveMax = target.clamp(64, 512);
+    debugPrint('[CHAT] adaptiveMax -> $_adaptiveMax (pieces=$tokenPieces, dt=${DateTime.now().difference(start).inSeconds}s)');
+  } catch (e) {
+    // Stream failed or timed out — replace placeholder with error
+    setState(() {
+      _isThinking = false;
+      final idx = _messages.indexWhere((m) => m.id == placeholderId);
+      if (idx >= 0) _messages.removeAt(idx);
+      _messages.insert(
+        0,
+        ChatMessage(
+          id: DateTime.now().toIso8601String(),
+          text: '❌ Stream failed: $e',
+          type: MessageType.bot,
+        ),
+      );
+    });
   }
+}
+
 
   @override
   Widget build(BuildContext context) {
@@ -148,16 +218,13 @@ class _ChatScreenState extends State<ChatScreen> {
     return SafeArea(
       child: Column(
         children: [
-          // header with title + New Chat (+)
+          // header
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
             child: Row(
               children: [
                 const Expanded(
-                  child: Text(
-                    "Chat with Local LLM",
-                    style: TextStyle(fontSize: 20),
-                  ),
+                  child: Text('Chat with Local LLM', style: TextStyle(fontSize: 20)),
                 ),
                 IconButton(
                   icon: const Icon(Icons.add),
@@ -170,23 +237,21 @@ class _ChatScreenState extends State<ChatScreen> {
 
           if (_isLoadingModel)
             Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               margin: const EdgeInsets.only(bottom: 6),
               decoration: BoxDecoration(
-                color: Colors.amber.shade100,
+                color: Colors.amber.withOpacity(0.2),
                 border: Border.all(color: Colors.amber.shade300),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: const Text("⏳ Loading model..."),
+              child: const Text('⏳ Loading model...'),
             ),
 
           Expanded(
             child: ListView.builder(
               reverse: true,
               itemCount: _messages.length,
-              itemBuilder: (context, index) =>
-                  MessageBubble(message: _messages[index]),
+              itemBuilder: (context, index) => MessageBubble(message: _messages[index]),
             ),
           ),
 

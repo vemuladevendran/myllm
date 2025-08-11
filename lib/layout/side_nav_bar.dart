@@ -21,7 +21,7 @@ class SideNavBar extends StatelessWidget {
             DrawerHeader(
               decoration: BoxDecoration(color: Theme.of(context).primaryColor),
               child: const Text(
-                'Chat with Gemini',
+                'Chat with your LLM',
                 style: TextStyle(fontSize: 20, color: Colors.white),
               ),
             ),

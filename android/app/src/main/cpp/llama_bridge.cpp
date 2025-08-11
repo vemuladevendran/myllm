@@ -1,11 +1,9 @@
-// llama_bridge.cpp (history + rolling window + overflow guard)
+// android/app/src/main/cpp/llama_bridge.cpp
 #include <android/log.h>
-#include <cstdint>
-#include <cstring>
-#include <limits>
 #include <string>
 #include <vector>
-#include <algorithm>
+#include <cstring>
+#include <limits>
 #include <llama.h>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "llama_bridge", __VA_ARGS__)
@@ -14,35 +12,29 @@
 // -----------------------------------------------------------------------------
 // Globals
 // -----------------------------------------------------------------------------
-static llama_model*   g_model           = nullptr;
-static llama_context* g_ctx             = nullptr;
-static bool           g_backend_inited  = false;
+static llama_model*   g_model = nullptr;
+static llama_context* g_ctx   = nullptr;
 
-static int32_t        g_seq_id          = 0;     // single chat thread
-static int32_t        g_next_pos        = 0;     // next timestep to write
-static int32_t        g_ctx_size        = 0;     // cached n_ctx
+// streaming state
+static bool g_stream_running = false;
+static int  g_stream_remaining = 0;
+static std::vector<llama_token> g_stream_prompt;
+static std::vector<llama_token> g_stream_gen;
+static int  g_stream_pos = 0;                   // absolute position in sequence
+static size_t g_stream_emitted_chars = 0;       // how many chars already sent to client
 
-// Rolling token history (prompt + generations) for rebuilds
-static std::vector<llama_token> g_history;
+// ------------------------------ Tunables ---------------------------------
+static const int   EARLY_MIN_CHARS      = 16;   // don’t stop too early
+static const int   EARLY_MIN_TOKENS     = 8;
+static const bool  STOP_ON_DOUBLE_NL    = true;
+static const bool  STOP_ON_SENTENCE_END = true; // stop after .!? if enough text
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-
-// KV clear compatible with your headers; switch to llama_memory_clear(ctx)
-// if your llama.cpp version has it.
-static inline void kv_clear(llama_context* ctx) {
-    if (!ctx) return;
-    // llama_memory_clear(ctx);   // <- newer llama.cpp
-    llama_kv_self_clear(ctx);     // <- available in your headers
-}
-
-static std::string detokenize_to_string(const llama_vocab * vocab,
-                                        const std::vector<llama_token> & toks,
-                                        bool remove_special = true,
-                                        bool unparse_special = false) {
-    if (!vocab || toks.empty()) return std::string();
-
+// ------------------------------ Utils -----------------------------------
+static std::string detok(const llama_vocab * vocab,
+                         const std::vector<llama_token> & toks,
+                         bool remove_special = true,
+                         bool unparse_special = false) {
+    if (toks.empty()) return {};
     int need = llama_detokenize(vocab, toks.data(), (int32_t)toks.size(),
                                 nullptr, 0, remove_special, unparse_special);
     if (need < 0) {
@@ -51,127 +43,61 @@ static std::string detokenize_to_string(const llama_vocab * vocab,
         int got = llama_detokenize(vocab, toks.data(), (int32_t)toks.size(),
                                    out.data(), len, remove_special, unparse_special);
         if (got > 0 && got <= len) { out.resize(got); return out; }
-        return std::string();
+        return {};
     } else if (need == 0) {
-        return std::string();
+        return {};
     } else {
         std::string out(need, '\0');
         int got = llama_detokenize(vocab, toks.data(), (int32_t)toks.size(),
                                    out.data(), need, remove_special, unparse_special);
         if (got > 0 && got <= need) { out.resize(got); return out; }
-        return std::string();
+        return {};
     }
 }
 
-// Feed `toks` into the context at positions [start_pos, ...] for seq g_seq_id.
-// We chunk to avoid creating enormous batches.
-static bool feed_tokens(const llama_vocab* vocab,
-                        const std::vector<llama_token>& toks,
-                        int32_t start_pos,
-                        int32_t chunk = 256,
-                        bool request_logits_on_last = true) {
-    if (toks.empty()) return true;
-
-    int32_t pos = start_pos;
-    for (size_t off = 0; off < toks.size(); off += (size_t)chunk) {
-        const int32_t n = (int32_t)std::min<size_t>(chunk, toks.size() - off);
-        llama_batch batch = llama_batch_init(n, /*embd*/0, /*n_seq_max*/1);
-
-        for (int32_t i = 0; i < n; ++i) {
-            const bool is_last_global = (off + i == toks.size() - 1);
-            batch.token[i]     = toks[off + i];
-            batch.pos[i]       = pos + i;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = g_seq_id;
-            batch.logits[i]    = (is_last_global && request_logits_on_last) ? 1 : 0;
-        }
-        batch.n_tokens = n;
-
-        const int32_t rc = llama_decode(g_ctx, batch);
-        llama_batch_free(batch);
-        if (rc != 0) return false;
-
-        pos += n;
-    }
-    return true;
+static inline void kv_clear() {
+    // If your headers have llama_memory_clear(g_ctx), prefer that.
+    // This call exists across many versions (deprecated on newest).
+    llama_kv_self_clear(g_ctx);
 }
 
-// Ensure we have space in KV to add `need_prompt` plus `need_gen` tokens.
-// If not, we rebuild the KV with the **tail** of g_history (rolling window).
-static bool ensure_capacity_for(const llama_vocab* vocab,
-                                int32_t need_prompt,
-                                int32_t need_gen) {
-    if (g_ctx_size <= 0) {
-        g_ctx_size = llama_n_ctx(g_ctx);
-    }
-
-    // A small safety margin so we never write exactly at end.
-    const int32_t margin = 16;
-    const int32_t needed_total = g_next_pos + need_prompt + std::max(need_gen, 0) + margin;
-
-    if (needed_total < g_ctx_size) {
-        return true; // we’re fine
-    }
-
-    // Need to rebuild: keep last window of history tokens that fits.
-    // Keep ~70% of context to leave room for new turns.
-    const int32_t target_keep = (int32_t)(g_ctx_size * 0.70);
-    const int32_t keep = std::min<int32_t>((int32_t)g_history.size(), target_keep);
-
-    std::vector<llama_token> tail;
-    if (keep > 0) {
-        tail.insert(tail.end(), g_history.end() - keep, g_history.end());
-    }
-
-    // Rebuild KV
-    kv_clear(g_ctx);
-    g_next_pos = 0;
-
-    if (!tail.empty()) {
-        if (!feed_tokens(vocab, tail, /*start_pos*/0, /*chunk*/256, /*request_logits_on_last*/false)) {
-            LOGE("[ensure_capacity_for] rebuild feed failed");
-            return false;
-        }
-        g_next_pos = keep;
-        // Replace history with the kept tail
-        g_history.swap(tail); // tail now holds old (to be discarded)
-        tail.clear();
-    } else {
-        g_history.clear();
-    }
-
-    LOGI("[ensure_capacity_for] KV rebuilt, kept=%d, g_next_pos=%d, n_ctx=%d",
-         keep, g_next_pos, g_ctx_size);
-
-    // Re-check after rebuild
-    const int32_t needed_total_after = g_next_pos + need_prompt + std::max(need_gen, 0) + margin;
-    return needed_total_after < g_ctx_size;
+static void stream_reset() {
+    g_stream_running = false;
+    g_stream_remaining = 0;
+    g_stream_prompt.clear();
+    g_stream_gen.clear();
+    g_stream_pos = 0;
+    g_stream_emitted_chars = 0;
 }
 
-// -----------------------------------------------------------------------------
-// C API
-// -----------------------------------------------------------------------------
+static bool should_stop_early(const std::string &full_text, int n_gen_tokens) {
+    if ((int)full_text.size() < EARLY_MIN_CHARS || n_gen_tokens < EARLY_MIN_TOKENS) return false;
+    if (STOP_ON_DOUBLE_NL) {
+        if (full_text.find("\n\n") != std::string::npos) return true;
+    }
+    if (STOP_ON_SENTENCE_END) {
+        char c = full_text.empty() ? '\0' : full_text.back();
+        if (c == '.' || c == '!' || c == '?') return true;
+    }
+    return false;
+}
+
+// ----------------------------- Lifecycle --------------------------------
 extern "C" __attribute__((visibility("default")))
 int lb_load(const char* model_path_cstr) {
     LOGI("[lb_load] path: %s", model_path_cstr ? model_path_cstr : "(null)");
-    if (!model_path_cstr || model_path_cstr[0] == '\0') {
-        LOGE("[lb_load] invalid model path");
-        return -1;
-    }
+    if (!model_path_cstr || model_path_cstr[0] == '\0') return -1;
 
     if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
 
-    if (!g_backend_inited) {
-        llama_backend_init();
-        g_backend_inited = true;
-        LOGI("[lb_load] llama_backend_init()");
-    }
+    llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
     g_model = llama_model_load_from_file(model_path_cstr, mparams);
     if (!g_model) {
         LOGE("llama_model_load_from_file failed");
+        llama_backend_free();
         return -2;
     }
 
@@ -180,91 +106,62 @@ int lb_load(const char* model_path_cstr) {
     if (!g_ctx) {
         LOGE("llama_init_from_model failed");
         llama_model_free(g_model); g_model = nullptr;
+        llama_backend_free();
         return -3;
     }
 
-    kv_clear(g_ctx);
-    g_seq_id   = 0;
-    g_next_pos = 0;
-    g_ctx_size = llama_n_ctx(g_ctx);
-    g_history.clear();
-
-    const llama_vocab * vocab = llama_model_get_vocab(g_model);
-    LOGI("model+context created OK (vocab=%d, n_ctx=%d)",
-         vocab ? llama_vocab_n_tokens(vocab) : -1, g_ctx_size);
+    stream_reset();
+    LOGI("model+context created OK");
     return 0;
 }
 
 extern "C" __attribute__((visibility("default")))
-int lb_is_loaded() {
-    return (g_ctx && g_model) ? 1 : 0;
-}
+int lb_is_loaded() { return (g_ctx && g_model) ? 1 : 0; }
 
 extern "C" __attribute__((visibility("default")))
 int lb_reset() {
-    LOGI("[lb_reset]");
-    if (!g_model) {
-        LOGE("[lb_reset] no model loaded");
-        return -1;
-    }
-    if (g_ctx) {
-        llama_free(g_ctx);
-        g_ctx = nullptr;
-    }
+    if (!g_model) return -1;
+    if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
     llama_context_params cparams = llama_context_default_params();
     g_ctx = llama_init_from_model(g_model, cparams);
-    if (!g_ctx) {
-        LOGE("[lb_reset] llama_init_from_model failed");
-        return -2;
-    }
-    kv_clear(g_ctx);
-    g_seq_id   = 0;
-    g_next_pos = 0;
-    g_ctx_size = llama_n_ctx(g_ctx);
-    g_history.clear();
-    LOGI("[lb_reset] context recreated + KV cleared (history reset)");
+    if (!g_ctx) return -2;
+    stream_reset();
     return 0;
 }
 
-// Clear history without recreating the context
+extern "C" __attribute__((visibility("default")))
+void lb_free() {
+    stream_reset();
+    if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+    llama_backend_free();
+}
+
 extern "C" __attribute__((visibility("default")))
 void lb_clear_history() {
     if (!g_ctx) return;
-    kv_clear(g_ctx);
-    g_seq_id   = 0;
-    g_next_pos = 0;
-    g_history.clear();
-    LOGI("[lb_clear_history] KV cleared, positions reset");
+    kv_clear();
+    stream_reset();
 }
 
-// Greedy generation with persistent history + overflow guard
+// --------------------------- Non-streaming -------------------------------
 extern "C" __attribute__((visibility("default")))
 const char* lb_eval(const char* prompt_cstr, int max_tokens) {
-    static std::string result;
-    result.clear();
-
-    if (!g_ctx || !g_model) {
-        result = "Model not loaded.";
-        return result.c_str();
-    }
+    static std::string result; result.clear();
+    if (!g_ctx || !g_model) { result = "Model not loaded."; return result.c_str(); }
     if (!prompt_cstr) prompt_cstr = "";
-    if (max_tokens <= 0) max_tokens = 1;
 
     const llama_vocab * vocab = llama_model_get_vocab(g_model);
-    if (!vocab) { result = "No vocab."; return result.c_str(); }
-    if (g_ctx_size <= 0) g_ctx_size = llama_n_ctx(g_ctx);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
 
-    // --- Tokenize prompt ---
+    // tokenize prompt
     const int prompt_len = (int) std::strlen(prompt_cstr);
     int32_t guess = std::max(32, prompt_len + 8);
     std::vector<llama_token> prompt_tokens(guess);
-
     int n_tok = llama_tokenize(vocab, prompt_cstr, prompt_len,
-                               prompt_tokens.data(), guess,
-                               /*add_special*/ 1, /*parse_special*/ 0);
+                               prompt_tokens.data(), guess, 1, 0);
     if (n_tok < 0) {
         int need = -n_tok;
-        if (need <= 0) { result = "Tokenization failed."; return result.c_str(); }
         prompt_tokens.resize(need);
         n_tok = llama_tokenize(vocab, prompt_cstr, prompt_len,
                                prompt_tokens.data(), need, 1, 0);
@@ -273,26 +170,25 @@ const char* lb_eval(const char* prompt_cstr, int max_tokens) {
         prompt_tokens.resize(n_tok);
     }
 
-    // Make sure we have capacity (rolling window rebuild if needed)
-    if (!ensure_capacity_for(vocab, /*need_prompt*/n_tok, /*need_gen*/max_tokens)) {
-        result = "Context overflow.";
-        return result.c_str();
+    // feed prompt (set pos[] and n_tokens)
+    {
+        kv_clear();
+        const int n = (int)prompt_tokens.size();
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        for (int i = 0; i < n; ++i) {
+            batch.token[i]    = prompt_tokens[i];
+            batch.pos[i]      = i;
+            batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0;
+            batch.logits[i]   = (i == n - 1) ? 1 : 0;
+        }
+        batch.n_tokens = n;
+        int32_t rc = llama_decode(g_ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) { result = "Decode failed on prompt."; return result.c_str(); }
     }
 
-    // --- Feed prompt at current position ---
-    if (!feed_tokens(vocab, prompt_tokens, /*start_pos*/g_next_pos, /*chunk*/256, /*request_logits_on_last*/true)) {
-        result = "Decode failed on prompt.";
-        return result.c_str();
-    }
-
-    // Store prompt into history
-    g_history.insert(g_history.end(), prompt_tokens.begin(), prompt_tokens.end());
-
-    // --- Generate ---
-    std::vector<llama_token> gen;
-    gen.reserve(std::max(1, max_tokens));
-
-    int32_t cur_pos = g_next_pos + n_tok; // first generation position
+    std::vector<llama_token> gen; gen.reserve(std::max(1, max_tokens));
+    size_t emitted_chars = 0; // for incremental detok
 
     for (int t = 0; t < max_tokens; ++t) {
         float * logits = llama_get_logits_ith(g_ctx, -1);
@@ -301,57 +197,165 @@ const char* lb_eval(const char* prompt_cstr, int max_tokens) {
         // greedy argmax
         int best_id = 0;
         float best_val = -std::numeric_limits<float>::infinity();
-        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         for (int i = 0; i < n_vocab; ++i) {
             const float v = logits[i];
             if (v > best_val) { best_val = v; best_id = i; }
         }
-
-        const llama_token next = (llama_token) best_id;
+        const llama_token next = (llama_token)best_id;
         if (llama_vocab_is_eog(vocab, next)) break;
 
         gen.push_back(next);
 
-        // Feed back one-by-one (request logits each step)
-        llama_batch batch = llama_batch_init(1, /*embd*/0, /*n_seq_max*/1);
-        batch.token[0]     = next;
-        batch.pos[0]       = cur_pos++;
-        batch.n_seq_id[0]  = 1;
-        batch.seq_id[0][0] = g_seq_id;
-        batch.logits[0]    = 1;
-        batch.n_tokens     = 1;
-
-        const int32_t rc = llama_decode(g_ctx, batch);
-        llama_batch_free(batch);
-        if (rc != 0) break;
-
-        // Guard: if generation is about to overflow ctx, stop early
-        if (cur_pos + 16 >= g_ctx_size) {
-            LOGI("[lb_eval] stopping early to avoid ctx overflow (cur_pos=%d, n_ctx=%d)", cur_pos, g_ctx_size);
-            break;
+        // feed back next token (set pos[] and n_tokens)
+        {
+            llama_batch batch = llama_batch_init(1, 0, 1);
+            batch.token[0]    = next;
+            batch.pos[0]      = (int)prompt_tokens.size() + (int)gen.size() - 1;
+            batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0;
+            batch.logits[0]   = 1;
+            batch.n_tokens    = 1;
+            int32_t rc = llama_decode(g_ctx, batch);
+            llama_batch_free(batch);
+            if (rc != 0) break;
         }
+
+        // Incremental detok by diff (keeps spaces/punctuation correct)
+        std::string full = detok(vocab, gen, true, false);
+        if (full.size() > emitted_chars) {
+            result += full.substr(emitted_chars);
+            emitted_chars = full.size();
+        }
+
+        // Early stop heuristic
+        if (should_stop_early(result, (int)gen.size())) break;
     }
 
-    // Update rolling state
-    g_history.insert(g_history.end(), gen.begin(), gen.end());
-    g_next_pos = cur_pos;
-
-    // --- Detokenize generated tokens only ---
-    result = detokenize_to_string(vocab, gen, /*remove_special*/true, /*unparse_special*/false);
     return result.c_str();
 }
 
+// ------------------------------ Streaming --------------------------------
 extern "C" __attribute__((visibility("default")))
-void lb_free() {
-    LOGI("[lb_free]");
-    if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
-    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
-    if (g_backend_inited) {
-        llama_backend_free();
-        g_backend_inited = false;
+int lb_stream_begin(const char* prompt_cstr, int max_tokens) {
+    if (!g_ctx || !g_model) return -1;
+    if (!prompt_cstr) prompt_cstr = "";
+
+    stream_reset();
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+
+    // tokenize prompt
+    const int prompt_len = (int) std::strlen(prompt_cstr);
+    int32_t guess = std::max(32, prompt_len + 8);
+    g_stream_prompt.resize(guess);
+    int n_tok = llama_tokenize(vocab, prompt_cstr, prompt_len,
+                               g_stream_prompt.data(), guess, 1, 0);
+    if (n_tok < 0) {
+        int need = -n_tok;
+        g_stream_prompt.resize(need);
+        n_tok = llama_tokenize(vocab, prompt_cstr, prompt_len,
+                               g_stream_prompt.data(), need, 1, 0);
+        if (n_tok <= 0) return -2;
+    } else {
+        g_stream_prompt.resize(n_tok);
     }
-    g_seq_id   = 0;
-    g_next_pos = 0;
-    g_ctx_size = 0;
-    g_history.clear();
+
+    // fresh KV + reset counters
+    kv_clear();
+    g_stream_pos = 0;
+    g_stream_emitted_chars = 0;
+
+    // feed prompt (set pos[] and n_tokens)
+    {
+        const int n = (int)g_stream_prompt.size();
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        for (int i = 0; i < n; ++i) {
+            batch.token[i]    = g_stream_prompt[i];
+            batch.pos[i]      = g_stream_pos + i;
+            batch.n_seq_id[i] = 1; batch.seq_id[i][0] = 0;
+            batch.logits[i]   = (i == n - 1) ? 1 : 0;
+        }
+        batch.n_tokens = n;
+        int32_t rc = llama_decode(g_ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) return -3;
+        g_stream_pos += n;
+    }
+
+    g_stream_running   = true;
+    g_stream_remaining = std::max(1, max_tokens);
+    g_stream_gen.clear();
+    return 0;
+}
+
+// returns: nullptr=hard error; ""=no new chars yet / finished; else text delta to append
+extern "C" __attribute__((visibility("default")))
+const char* lb_stream_next() {
+    static std::string delta; delta.clear();
+
+    if (!g_ctx || !g_model) return nullptr;
+    if (!g_stream_running)  { return ""; }
+    if (g_stream_remaining <= 0) {
+        g_stream_running = false; return "";
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    float * logits = llama_get_logits_ith(g_ctx, -1);
+    if (!logits) { g_stream_running = false; return nullptr; }
+
+    // greedy argmax
+    int best_id = 0;
+    float best_val = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n_vocab; ++i) {
+        const float v = logits[i];
+        if (v > best_val) { best_val = v; best_id = i; }
+    }
+    const llama_token next = (llama_token)best_id;
+    if (llama_vocab_is_eog(vocab, next)) {
+        g_stream_running = false;
+        return "";
+    }
+
+    g_stream_gen.push_back(next);
+
+    // feed it back (set pos[] and n_tokens)
+    {
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        batch.token[0]    = next;
+        batch.pos[0]      = g_stream_pos;
+        batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0;
+        batch.logits[0]   = 1;
+        batch.n_tokens    = 1;
+        int32_t rc = llama_decode(g_ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) { g_stream_running = false; return nullptr; }
+        g_stream_pos += 1;
+    }
+
+    g_stream_remaining -= 1;
+
+    // Incremental detok: detok full gen then emit only the new chars
+    std::string full = detok(vocab, g_stream_gen, true, false);
+    if (full.size() > g_stream_emitted_chars) {
+        delta = full.substr(g_stream_emitted_chars);
+        g_stream_emitted_chars = full.size();
+    } else {
+        delta.clear();
+    }
+
+    // Early stop
+    if (should_stop_early(full, (int)g_stream_gen.size())) {
+        g_stream_running = false;
+    }
+
+    return delta.c_str();
+}
+
+extern "C" __attribute__((visibility("default")))
+int lb_stream_is_running() { return g_stream_running ? 1 : 0; }
+
+extern "C" __attribute__((visibility("default")))
+void lb_stream_cancel() {
+    stream_reset();
 }

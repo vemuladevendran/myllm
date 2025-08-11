@@ -1,27 +1,9 @@
 // lib/llm/llama_ffi.dart
-//
-// Minimal, production-ready FFI bindings for llama_bridge.{so}
-// Exposes: loadModel, runModel, resetContext, clearHistory, unloadModel
-//
-// NOTE: This assumes:
-//   - android/app/src/main/jniLibs/arm64-v8a/libllama.so  (prebuilt from llama.cpp)
-//   - android builds a shared "llama_bridge" from your C++ file (llama_bridge.cpp)
-//   - libllama_bridge.so is loadable at runtime
-//
-// If you rename symbols in C++ side, update lookups here accordingly.
-
 import 'dart:ffi';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
-import 'dart:io' show File, Platform;
 
 DynamicLibrary _openBridge() {
-  // On Android, the linker finds libs by soname inside the app package.
-  // If you change the output name in CMake, update this string.
-  if (!Platform.isAndroid) {
-    throw UnsupportedError('llama_ffi is currently Android-only.');
-  }
   final lib = DynamicLibrary.open('libllama_bridge.so');
   debugPrint('[FFI] Opened libllama_bridge.so');
   return lib;
@@ -29,168 +11,134 @@ DynamicLibrary _openBridge() {
 
 final DynamicLibrary _bridge = _openBridge();
 
-/// -------------------------
-/// Native type definitions
-/// -------------------------
+// ---------- base FFI ----------
 
 // int lb_load(const char* path)
 typedef _LbLoadNative = Int32 Function(Pointer<Utf8>);
 typedef _LbLoadDart = int Function(Pointer<Utf8>);
+final _LbLoadDart _lbLoad =
+    _bridge.lookup<NativeFunction<_LbLoadNative>>('lb_load').asFunction();
 
 // int lb_is_loaded()
 typedef _LbIsLoadedNative = Int32 Function();
 typedef _LbIsLoadedDart = int Function();
+final _LbIsLoadedDart _lbIsLoaded =
+    _bridge.lookup<NativeFunction<_LbIsLoadedNative>>('lb_is_loaded').asFunction();
 
 // int lb_reset()
 typedef _LbResetNative = Int32 Function();
 typedef _LbResetDart = int Function();
+final _LbResetDart _lbReset =
+    _bridge.lookup<NativeFunction<_LbResetNative>>('lb_reset').asFunction();
 
 // const char* lb_eval(const char* prompt, int max_tokens)
 typedef _LbEvalNative = Pointer<Utf8> Function(Pointer<Utf8>, Int32);
 typedef _LbEvalDart = Pointer<Utf8> Function(Pointer<Utf8>, int);
+final _LbEvalDart _lbEval =
+    _bridge.lookup<NativeFunction<_LbEvalNative>>('lb_eval').asFunction();
 
 // void lb_free()
 typedef _LbFreeNative = Void Function();
 typedef _LbFreeDart = void Function();
-
-// void lb_clear_history()
-typedef _LbClearHistoryNative = Void Function();
-typedef _LbClearHistoryDart = void Function();
-
-/// -------------------------
-/// Symbol lookups
-/// -------------------------
-
-final _LbLoadDart _lbLoad =
-    _bridge.lookup<NativeFunction<_LbLoadNative>>('lb_load').asFunction();
-
-final _LbIsLoadedDart _lbIsLoaded =
-    _bridge.lookup<NativeFunction<_LbIsLoadedNative>>('lb_is_loaded').asFunction();
-
-final _LbResetDart _lbReset =
-    _bridge.lookup<NativeFunction<_LbResetNative>>('lb_reset').asFunction();
-
-final _LbEvalDart _lbEval =
-    _bridge.lookup<NativeFunction<_LbEvalNative>>('lb_eval').asFunction();
-
 final _LbFreeDart _lbFree =
     _bridge.lookup<NativeFunction<_LbFreeNative>>('lb_free').asFunction();
 
-final _LbClearHistoryDart _lbClearHistory =
-    _bridge.lookup<NativeFunction<_LbClearHistoryNative>>('lb_clear_history').asFunction();
+// (optional) void lb_clear_history()
+typedef _LbClearHistoryNative = Void Function();
+typedef _LbClearHistoryDart = void Function();
+// Bind if available; null if symbol doesn't exist.
+final _LbClearHistoryDart? _lbClearHistory = (() {
+  try {
+    return _bridge
+        .lookup<NativeFunction<_LbClearHistoryNative>>('lb_clear_history')
+        .asFunction<_LbClearHistoryDart>();
+  } catch (_) {
+    return null;
+  }
+})();
 
-/// -------------------------
-/// Public helpers (safe API)
-/// -------------------------
+// ---------- streaming FFI ----------
 
-/// Load a `.gguf` stored in app documents directory.
-/// You can pass with or without ".gguf" extension.
-/// Returns true if model & context are ready.
-Future<bool> loadModel(String modelFileName) async {
-  final dir = await getApplicationDocumentsDirectory();
-  final hasExt = modelFileName.toLowerCase().endsWith('.gguf');
-  final fullPath = '${dir.path}/${hasExt ? modelFileName : '$modelFileName.gguf'}';
+// int lb_stream_begin(const char* prompt, int max_tokens)
+typedef _LbStreamBeginNative = Int32 Function(Pointer<Utf8>, Int32);
+typedef _LbStreamBeginDart = int Function(Pointer<Utf8>, int);
+final _LbStreamBeginDart _lbStreamBegin = _bridge
+    .lookup<NativeFunction<_LbStreamBeginNative>>('lb_stream_begin')
+    .asFunction();
 
-  debugPrint('[FFI] Loading model: $fullPath');
+// const char* lb_stream_next()
+typedef _LbStreamNextNative = Pointer<Utf8> Function();
+typedef _LbStreamNextDart = Pointer<Utf8> Function();
+final _LbStreamNextDart _lbStreamNext = _bridge
+    .lookup<NativeFunction<_LbStreamNextNative>>('lb_stream_next')
+    .asFunction();
 
+// int lb_stream_is_running()
+typedef _LbStreamIsRunningNative = Int32 Function();
+typedef _LbStreamIsRunningDart = int Function();
+final _LbStreamIsRunningDart _lbStreamIsRunning = _bridge
+    .lookup<NativeFunction<_LbStreamIsRunningNative>>('lb_stream_is_running')
+    .asFunction();
+
+// void lb_stream_cancel()
+typedef _LbStreamCancelNative = Void Function();
+typedef _LbStreamCancelDart = void Function();
+final _LbStreamCancelDart _lbStreamCancel = _bridge
+    .lookup<NativeFunction<_LbStreamCancelNative>>('lb_stream_cancel')
+    .asFunction();
+
+// ---------- public helpers (call from the worker isolate) ----------
+
+int ffiLoadModelAtPath(String fullPath) {
   final p = fullPath.toNativeUtf8();
   try {
-    final rc = _lbLoad(p);
-    final ok = rc == 0 && _lbIsLoaded() != 0;
-    debugPrint('[FFI] lb_load rc=$rc, isLoaded=$ok');
-    return ok;
-  } catch (e) {
-    debugPrint('❌ lb_load threw: $e');
-    return false;
+    return _lbLoad(p);
   } finally {
     calloc.free(p);
   }
 }
 
-/// Evaluate a prompt with a max token budget.
-/// NOTE: This call is synchronous and will block the thread.
-/// Run it off the UI thread (e.g., in an isolate) if your model is slow.
-Future<String> runModel(String prompt, {int maxTokens = 128}) async {
-  if (_lbIsLoaded() == 0) return 'Model not loaded.';
-  debugPrint("[FFI] eval(prompt='${_shorten(prompt)}', maxTokens=$maxTokens)");
+bool ffiIsLoaded() => _lbIsLoaded() != 0;
 
+int ffiReset() => _lbReset();
+
+String ffiEval(String prompt, int maxTokens) {
   final p = prompt.toNativeUtf8();
   try {
-    final resPtr = _lbEval(p, maxTokens);
-    final out = resPtr.cast<Utf8>().toDartString();
-    debugPrint("[FFI] eval -> '${_shorten(out)}'");
-    return out;
-  } catch (e) {
-    debugPrint('❌ lb_eval threw: $e');
+    final res = _lbEval(p, maxTokens);
+    return res.cast<Utf8>().toDartString();
+  } catch (_) {
     return 'Evaluation failed.';
   } finally {
     calloc.free(p);
   }
 }
 
-/// Recreate context (clears KV + resets internal state)
-Future<bool> resetContext() async {
-  if (_lbIsLoaded() == 0) return false;
-  try {
-    final rc = _lbReset();
-    debugPrint('[FFI] lb_reset rc=$rc');
-    return rc == 0;
-  } catch (e) {
-    debugPrint('❌ lb_reset threw: $e');
-    return false;
-  }
+void ffiFree() => _lbFree();
+
+void ffiClearHistory() {
+  // Call only if the native symbol exists
+  final fn = _lbClearHistory;
+  if (fn != null) fn();
 }
 
-/// Clears history (KV cache) without recreating the context.
-/// Use this for "New chat" UX.
-void clearHistory() {
+// ----- streaming helpers -----
+
+int ffiStreamBegin(String prompt, int maxTokens) {
+  final p = prompt.toNativeUtf8();
   try {
-    _lbClearHistory();
-    debugPrint('[FFI] lb_clear_history done');
-  } catch (e) {
-    debugPrint('❌ lb_clear_history threw: $e');
-  }
-}
-
-/// Dispose all native resources (model, context, backend).
-void unloadModel() {
-  try {
-    _lbFree();
-    debugPrint('[FFI] lb_free done');
-  } catch (e) {
-    debugPrint('❌ lb_free threw: $e');
-  }
-}
-
-
-// === Add to lib/llm/llama_ffi.dart ===
-
-Future<bool> loadModelAtPath(String fullPath) async {
-  debugPrint('[FFI] Loading model (full path): $fullPath');
-  final p = fullPath.toNativeUtf8();
-  try {
-    final rc = _lbLoad(p);
-    final ok = rc == 0 && _lbIsLoaded() != 0;
-    debugPrint('[FFI] lb_load rc=$rc, isLoaded=$ok');
-    return ok;
-  } catch (e) {
-    debugPrint('❌ lb_load (full path) threw: $e');
-    return false;
+    return _lbStreamBegin(p, maxTokens);
   } finally {
     calloc.free(p);
   }
 }
 
-
-/// Convenience: are we loaded?
-bool get isLoaded => _lbIsLoaded() != 0;
-
-/// -------------------------
-/// Small utilities
-/// -------------------------
-
-String _shorten(String s, {int max = 80}) {
-  final oneLine = s.replaceAll('\n', ' ');
-  if (oneLine.length <= max) return oneLine;
-  return '${oneLine.substring(0, max)}…';
+String? ffiStreamNext() {
+  final ptr = _lbStreamNext();
+  if (ptr.address == 0) return null; // native error
+  return ptr.cast<Utf8>().toDartString();
 }
+
+bool ffiStreamIsRunning() => _lbStreamIsRunning() != 0;
+
+void ffiStreamCancel() => _lbStreamCancel();
